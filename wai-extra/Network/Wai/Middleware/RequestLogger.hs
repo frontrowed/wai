@@ -32,6 +32,8 @@ import Network.Wai
   )
 import System.Log.FastLogger
 import Network.HTTP.Types as H
+import Data.Char (ord)
+import qualified Data.List as L
 import Data.Maybe (fromMaybe)
 import Data.Monoid (mconcat, (<>))
 import Data.Time (getCurrentTime, diffUTCTime, NominalDiffTime)
@@ -39,7 +41,7 @@ import Network.Wai.Parse (sinkRequestBody, lbsBackEnd, fileName, Param, File
                          , getRequestBodyType)
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Char8 as S8
-import System.Console.ANSI
+import System.Console.ANSI as ANSI
 import Data.IORef.Lifted
 import System.IO.Unsafe
 import Network.Wai.Internal (Response (..))
@@ -47,10 +49,12 @@ import Data.Default.Class (Default (def))
 import Network.Wai.Logger
 import Network.Wai.Middleware.RequestLogger.Internal
 import Network.Wai.Header (contentLength)
-import Data.Text.Encoding (decodeUtf8')
+import qualified Data.Text as T (pack)
+import Data.Text.Encoding (decodeUtf8', encodeUtf8)
 
 data OutputFormat = Apache IPAddrSource
                   | Detailed Bool -- ^ use colors?
+                  | DetailedResponse Bool -- ^ use colors?
                   | CustomOutputFormat OutputFormatter
                   | CustomOutputFormatWithDetails OutputFormatterWithDetails
 
@@ -103,6 +107,9 @@ mkRequestLogger RequestLoggerSettings{..} = do
         Detailed useColors -> detailedMiddleware
                                   (\str -> callback str >> flusher)
                                   useColors
+        DetailedResponse useColors -> detailedMiddlewareWithResponse
+                                          (\str -> callback str >> flusher)
+                                          useColors
         CustomOutputFormat formatter -> do
             getDate <- getDateGetter flusher
             return $ customMiddleware callback getDate formatter
@@ -185,6 +192,15 @@ detailedMiddleware cb useColors =
 
     in return $ detailedMiddleware' cb ansiColor ansiMethod ansiStatusCode
 
+detailedMiddlewareWithResponse :: Callback -> Bool -> IO Middleware
+detailedMiddlewareWithResponse cb useColors =
+    let (ansiColor, ansiMethod, ansiStatusCode) =
+          if useColors
+            then (ansiColor', ansiMethod', ansiStatusCode')
+            else (\_ t -> [t], (:[]), \_ t -> [t])
+
+    in return $ detailedMiddlewareWithResponse' cb ansiColor ansiMethod ansiStatusCode
+
 ansiColor' :: Color -> BS.ByteString -> [BS.ByteString]
 ansiColor' color bs =
     [ pack $ setSGRCode [SetColor Foreground Dull color]
@@ -243,6 +259,145 @@ getRequestBody req = do
              x:y -> (y, x)
   let req' = req { requestBody = rbody }
   return (req', body)
+
+maxLength :: Int
+maxLength = 1000
+
+-- | Output formatter that prints the response body.  Meant to be used
+-- after @'Detailed' True@ (use two @RequestLogger@s).  Not meant to
+-- be used on production.
+formatResponse :: ResponseHeaders -> B.Builder -> [S8.ByteString]
+formatResponse headers response =
+    pack <$>
+    [ ANSI.setSGRCode [ANSI.SetColor ANSI.Foreground ANSI.Dull ANSI.White]
+    , "  Response Content Type: "
+    , ANSI.setSGRCode [ANSI.Reset]
+    , maybe "Unknown" unpack $ getContentType headers
+    , "\n"
+    , ANSI.setSGRCode [ANSI.SetColor ANSI.Foreground ANSI.Dull ANSI.White]
+    , heading loggedBody
+    , ANSI.setSGRCode [ANSI.Reset]
+    , unpack $ message loggedBody
+    , "\n"
+    ]
+  where
+    loggedBody = makeLoggedBodyInfo (getContentType headers) $ B.toByteString response
+    -- Retrieve the value for the Content-Type header, if one exists
+    getContentType = fmap snd . L.find ((== hContentType) . fst)
+
+data LoggedBodyInfo = LoggedBodyInfo
+  { heading :: String
+  , message :: BS.ByteString
+  }
+
+-- | Generates terminal-friendly heading and content for logging a response
+-- body.
+--
+-- If the response body is long, or if we don't consider it a printable
+-- content type, then this generates log info with the content length.  For
+-- short, textual responses, this filters potentially terminal-unfriendly
+-- characters out of the response body. Generates a heading appropriate for
+-- the type of info logged (content length, response body, or filtered
+-- response body).
+makeLoggedBodyInfo :: Maybe S8.ByteString -> BS.ByteString -> LoggedBodyInfo
+makeLoggedBodyInfo contentType body
+  | not (isPrintableContentType contentType) || len > maxLength =
+    LoggedBodyInfo "  Response Content Length: " . encodeUtf8 . T.pack . show $ len
+  | otherwise = logFilteredBody $ S8.filter terminalFriendly body
+  where
+    len = S8.length body
+    logFilteredBody body'
+      | S8.length body' == len = LoggedBodyInfo "  Response Body: " $ body'
+      | otherwise = LoggedBodyInfo "  Response Body (filtered): " $ body'
+    -- Allow only printable, basic ASCII characters
+    terminalFriendly w
+      | ord w < 8 = False      -- Problematic control characters
+      | ord w < 14 = True      -- Plausibly useful control characters (like \t)
+      | ord w < 32 = False     -- More control characters
+      | ord w < 128 = True     -- Vanilla 7-bit ASCII text
+      | otherwise = False
+
+isPrintableContentType :: Maybe S8.ByteString -> Bool
+isPrintableContentType Nothing = False
+isPrintableContentType (Just contentType) =
+  any (`S8.isPrefixOf` contentType)
+    [ "text/"
+    , "application/json"
+    , "application/javascript"
+    ]
+
+detailedMiddlewareWithResponse' :: Callback
+                    -> (Color -> BS.ByteString -> [BS.ByteString])
+                    -> (BS.ByteString -> [BS.ByteString])
+                    -> (BS.ByteString -> BS.ByteString -> [BS.ByteString])
+                    -> Middleware
+detailedMiddlewareWithResponse' cb ansiColor ansiMethod ansiStatusCode app req sendResponse = do
+    (req', body) <-
+        -- second tuple item should not be necessary, but a test runner might mess it up
+        case (requestBodyLength req, contentLength (requestHeaders req)) of
+            -- log the request body if it is small
+            (KnownLength len, _) | len <= 2048 -> getRequestBody req
+            (_, Just len)        | len <= 2048 -> getRequestBody req
+            _ -> return (req, [])
+
+    let reqbodylog _ = if null body then [""] else ansiColor White "  Request Body: " <> body <> ["\n"]
+        reqbody = concatMap (either (const [""]) reqbodylog . decodeUtf8') body
+    postParams <- if requestMethod req `elem` ["GET", "HEAD"]
+        then return []
+        else do postParams <- liftIO $ allPostParams body
+                return $ collectPostParams postParams
+
+    let getParams = map emptyGetParam $ queryString req
+        accept = fromMaybe "" $ lookup H.hAccept $ requestHeaders req
+        params = let par | not $ null postParams = [pack (show postParams)]
+                         | not $ null getParams  = [pack (show getParams)]
+                         | otherwise             = []
+                 in if null par then [""] else ansiColor White "  Params: " <> par <> ["\n"]
+
+    t0 <- getCurrentTime
+    app req' $ \rsp -> do
+        let isRaw =
+                case rsp of
+                    ResponseRaw{} -> True
+                    _ -> False
+            stCode = statusBS rsp
+            stMsg = msgBS rsp
+        t1 <- getCurrentTime
+        builderIO <- newIORef $ B.fromByteString ""
+        rsp' <- recordChunks builderIO rsp
+        rspBody <- readIORef builderIO
+
+        -- log the status of the response
+        cb $ mconcat $ map toLogStr $
+            ansiMethod (requestMethod req) ++ [" ", rawPathInfo req, "\n"] ++
+            params ++ reqbody ++
+            ansiColor White "  Accept: " ++ [accept, "\n"] ++
+            (if isRaw then [] else
+                ansiColor White "  Status: " ++
+                ansiStatusCode stCode (stCode <> " " <> stMsg) ++
+                [" ", pack $ show $ diffUTCTime t1 t0, "\n"] ++
+                formatResponse (responseHeaders rsp) rspBody)
+
+        sendResponse rsp'
+  where
+    allPostParams body =
+        case getRequestBodyType req of
+            Nothing -> return ([], [])
+            Just rbt -> do
+                ichunks <- newIORef body
+                let rbody = atomicModifyIORef ichunks $ \chunks ->
+                        case chunks of
+                            [] -> ([], S8.empty)
+                            x:y -> (y, x)
+                sinkRequestBody lbsBackEnd rbt rbody
+
+    emptyGetParam :: (BS.ByteString, Maybe BS.ByteString) -> (BS.ByteString, BS.ByteString)
+    emptyGetParam (k, Just v) = (k,v)
+    emptyGetParam (k, Nothing) = (k,"")
+
+    collectPostParams :: ([Param], [File LBS.ByteString]) -> [Param]
+    collectPostParams (postParams, files) = postParams ++
+      map (\(k,v) -> (k, "FILE: " <> fileName v)) files
 
 detailedMiddleware' :: Callback
                     -> (Color -> BS.ByteString -> [BS.ByteString])
