@@ -5,6 +5,7 @@ module Network.Wai.Handler.Launch
     ( run
     , runUrl
     , runUrlPort
+    , runHostPortUrl
     ) where
 
 import Network.Wai
@@ -13,7 +14,9 @@ import Network.HTTP.Types
 import qualified Network.Wai.Handler.Warp as Warp
 import Data.IORef
 import Data.Monoid (mappend)
-import Control.Concurrent (forkIO, threadDelay)
+import Data.String (fromString)
+import Control.Concurrent (forkIO, threadDelay, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.Async (race)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad (unless)
 import Control.Exception (throwIO)
@@ -31,9 +34,9 @@ import Data.Streaming.Blaze (newBlazeRecv, defaultStrategy)
 import qualified Data.Streaming.Zlib as Z
 
 ping :: IORef Bool -> Middleware
-ping  var app req sendResponse
+ping  active app req sendResponse
     | pathInfo req == ["_ping"] = do
-        liftIO $ writeIORef var True
+        liftIO $ writeIORef active True
         sendResponse $ responseLBS status200 [] ""
     | otherwise = app req $ \res -> do
         let isHtml hs =
@@ -186,21 +189,34 @@ runUrl :: String -> Application -> IO ()
 runUrl = runUrlPort 4587
 
 runUrlPort :: Int -> String -> Application -> IO ()
-runUrlPort port url app = do
-    x <- newIORef True
-    _ <- forkIO $ Warp.runSettings
-        ( Warp.setPort port
-        $ Warp.setOnException (\_ _ -> return ())
-        $ Warp.setHost "*4" Warp.defaultSettings)
-        $ ping x app
-    launch port url
-    loop x
+runUrlPort = runHostPortUrl "*4"
+
+-- |
+--
+-- @since 3.0.1
+runHostPortUrl :: String -> Int -> String -> Application -> IO ()
+runHostPortUrl host port url app = do
+    ready <- newEmptyMVar
+    active <- newIORef True
+    let settings =
+          Warp.setPort port $
+          Warp.setOnException (\_ _ -> return ()) $
+          Warp.setHost (fromString host) $
+          Warp.setBeforeMainLoop (putMVar ready ()) $
+          Warp.defaultSettings
+    -- Run these threads concurrently; when either one terminates or
+    -- raises an exception, the same happens to the other.
+    fmap (either id id) $ race
+      -- serve app, keep updating the activity flag
+      (Warp.runSettings settings (ping active app))
+      -- wait for server startup, launch browser, poll until server idle
+      (takeMVar ready >> launch port url >> loop active)
 
 loop :: IORef Bool -> IO ()
-loop x = do
+loop active = do
     let seconds = 120
     threadDelay $ 1000000 * seconds
-    b <- readIORef x
+    b <- readIORef active
     if b
-        then writeIORef x False >> loop x
+        then writeIORef active False >> loop active
         else return ()
