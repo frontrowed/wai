@@ -183,7 +183,13 @@ logStdoutDev = unsafePerformIO $ mkRequestLogger def
 -- >   Accept: text/css,*/*;q=0.1
 -- >   Status: 304 Not Modified 0.010555s
 
--- detailedMiddleware :: Callback -> Bool -> IO Middleware
+detailedMiddleware ::
+  (Callback ->
+  (Color -> S8.ByteString -> [S8.ByteString]) ->
+  (S8.ByteString -> [S8.ByteString]) ->
+  (S8.ByteString -> S8.ByteString -> [S8.ByteString]) ->
+  Middleware) ->
+  Callback -> Bool -> IO Middleware
 detailedMiddleware f cb useColors =
     let (ansiColor, ansiMethod, ansiStatusCode) =
           if useColors
@@ -358,9 +364,9 @@ detailedMiddleware' includeResponse cb ansiColor ansiMethod ansiStatusCode app r
           then do
             builderIO <- newIORef $ B.fromByteString ""
             rsp' <- recordChunks builderIO rsp
-            (rsp', pure . formatResponse (responseHeaders rsp') <$> readIORef builderIO)
+            (,) rsp' . formatResponse (responseHeaders rsp') <$> readIORef builderIO
           else
-            (rsp, [])
+            (,) rsp <$> pure []
 
 
         -- log the status of the response
