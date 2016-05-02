@@ -104,10 +104,10 @@ mkRequestLogger RequestLoggerSettings{..} = do
             getdate <- getDateGetter flusher
             apache <- initLogger ipsrc (LogCallback callback flusher) getdate
             return $ apacheMiddleware apache
-        Detailed useColors -> detailedMiddleware
+        Detailed useColors -> detailedMiddleware (detailedMiddleware' False)
                                   (\str -> callback str >> flusher)
                                   useColors
-        DetailedResponse useColors -> detailedMiddlewareWithResponse
+        DetailedResponse useColors -> detailedMiddleware (detailedMiddleware' True)
                                           (\str -> callback str >> flusher)
                                           useColors
         CustomOutputFormat formatter -> do
@@ -183,23 +183,14 @@ logStdoutDev = unsafePerformIO $ mkRequestLogger def
 -- >   Accept: text/css,*/*;q=0.1
 -- >   Status: 304 Not Modified 0.010555s
 
-detailedMiddleware :: Callback -> Bool -> IO Middleware
-detailedMiddleware cb useColors =
+-- detailedMiddleware :: Callback -> Bool -> IO Middleware
+detailedMiddleware f cb useColors =
     let (ansiColor, ansiMethod, ansiStatusCode) =
           if useColors
             then (ansiColor', ansiMethod', ansiStatusCode')
             else (\_ t -> [t], (:[]), \_ t -> [t])
 
-    in return $ detailedMiddleware' cb ansiColor ansiMethod ansiStatusCode
-
-detailedMiddlewareWithResponse :: Callback -> Bool -> IO Middleware
-detailedMiddlewareWithResponse cb useColors =
-    let (ansiColor, ansiMethod, ansiStatusCode) =
-          if useColors
-            then (ansiColor', ansiMethod', ansiStatusCode')
-            else (\_ t -> [t], (:[]), \_ t -> [t])
-
-    in return $ detailedMiddlewareWithResponse' cb ansiColor ansiMethod ansiStatusCode
+    in return $ f cb ansiColor ansiMethod ansiStatusCode
 
 ansiColor' :: Color -> BS.ByteString -> [BS.ByteString]
 ansiColor' color bs =
@@ -263,9 +254,7 @@ getRequestBody req = do
 maxLength :: Int
 maxLength = 1000
 
--- | Output formatter that prints the response body.  Meant to be used
--- after @'Detailed' True@ (use two @RequestLogger@s).  Not meant to
--- be used on production.
+-- | Output formatter that prints the response body.
 formatResponse :: ResponseHeaders -> B.Builder -> [S8.ByteString]
 formatResponse headers response =
     pack <$>
@@ -326,12 +315,13 @@ isPrintableContentType (Just contentType) =
     , "application/javascript"
     ]
 
-detailedMiddlewareWithResponse' :: Callback
+detailedMiddleware' :: Bool
+                    -> Callback
                     -> (Color -> BS.ByteString -> [BS.ByteString])
                     -> (BS.ByteString -> [BS.ByteString])
                     -> (BS.ByteString -> BS.ByteString -> [BS.ByteString])
                     -> Middleware
-detailedMiddlewareWithResponse' cb ansiColor ansiMethod ansiStatusCode app req sendResponse = do
+detailedMiddleware' includeResponse cb ansiColor ansiMethod ansiStatusCode app req sendResponse = do
     (req', body) <-
         -- second tuple item should not be necessary, but a test runner might mess it up
         case (requestBodyLength req, contentLength (requestHeaders req)) of
@@ -363,79 +353,15 @@ detailedMiddlewareWithResponse' cb ansiColor ansiMethod ansiStatusCode app req s
             stCode = statusBS rsp
             stMsg = msgBS rsp
         t1 <- getCurrentTime
-        builderIO <- newIORef $ B.fromByteString ""
-        rsp' <- recordChunks builderIO rsp
-        rspBody <- readIORef builderIO
+        (rsp', logRsp) <-
+          if includeResponse
+          then do
+            builderIO <- newIORef $ B.fromByteString ""
+            rsp' <- recordChunks builderIO rsp
+            (rsp', pure . formatResponse (responseHeaders rsp') <$> readIORef builderIO)
+          else
+            (rsp, [])
 
-        -- log the status of the response
-        cb $ mconcat $ map toLogStr $
-            ansiMethod (requestMethod req) ++ [" ", rawPathInfo req, "\n"] ++
-            params ++ reqbody ++
-            ansiColor White "  Accept: " ++ [accept, "\n"] ++
-            (if isRaw then [] else
-                ansiColor White "  Status: " ++
-                ansiStatusCode stCode (stCode <> " " <> stMsg) ++
-                [" ", pack $ show $ diffUTCTime t1 t0, "\n"] ++
-                formatResponse (responseHeaders rsp) rspBody)
-
-        sendResponse rsp'
-  where
-    allPostParams body =
-        case getRequestBodyType req of
-            Nothing -> return ([], [])
-            Just rbt -> do
-                ichunks <- newIORef body
-                let rbody = atomicModifyIORef ichunks $ \chunks ->
-                        case chunks of
-                            [] -> ([], S8.empty)
-                            x:y -> (y, x)
-                sinkRequestBody lbsBackEnd rbt rbody
-
-    emptyGetParam :: (BS.ByteString, Maybe BS.ByteString) -> (BS.ByteString, BS.ByteString)
-    emptyGetParam (k, Just v) = (k,v)
-    emptyGetParam (k, Nothing) = (k,"")
-
-    collectPostParams :: ([Param], [File LBS.ByteString]) -> [Param]
-    collectPostParams (postParams, files) = postParams ++
-      map (\(k,v) -> (k, "FILE: " <> fileName v)) files
-
-detailedMiddleware' :: Callback
-                    -> (Color -> BS.ByteString -> [BS.ByteString])
-                    -> (BS.ByteString -> [BS.ByteString])
-                    -> (BS.ByteString -> BS.ByteString -> [BS.ByteString])
-                    -> Middleware
-detailedMiddleware' cb ansiColor ansiMethod ansiStatusCode app req sendResponse = do
-    (req', body) <-
-        -- second tuple item should not be necessary, but a test runner might mess it up
-        case (requestBodyLength req, contentLength (requestHeaders req)) of
-            -- log the request body if it is small
-            (KnownLength len, _) | len <= 2048 -> getRequestBody req
-            (_, Just len)        | len <= 2048 -> getRequestBody req
-            _ -> return (req, [])
-
-    let reqbodylog _ = if null body then [""] else ansiColor White "  Request Body: " <> body <> ["\n"]
-        reqbody = concatMap (either (const [""]) reqbodylog . decodeUtf8') body
-    postParams <- if requestMethod req `elem` ["GET", "HEAD"]
-        then return []
-        else do postParams <- liftIO $ allPostParams body
-                return $ collectPostParams postParams
-
-    let getParams = map emptyGetParam $ queryString req
-        accept = fromMaybe "" $ lookup H.hAccept $ requestHeaders req
-        params = let par | not $ null postParams = [pack (show postParams)]
-                         | not $ null getParams  = [pack (show getParams)]
-                         | otherwise             = []
-                 in if null par then [""] else ansiColor White "  Params: " <> par <> ["\n"]
-
-    t0 <- getCurrentTime
-    app req' $ \rsp -> do
-        let isRaw =
-                case rsp of
-                    ResponseRaw{} -> True
-                    _ -> False
-            stCode = statusBS rsp
-            stMsg = msgBS rsp
-        t1 <- getCurrentTime
 
         -- log the status of the response
         cb $ mconcat $ map toLogStr $
@@ -445,9 +371,10 @@ detailedMiddleware' cb ansiColor ansiMethod ansiStatusCode app req sendResponse 
             if isRaw then [] else
                 ansiColor White "  Status: " ++
                 ansiStatusCode stCode (stCode <> " " <> stMsg) ++
-                [" ", pack $ show $ diffUTCTime t1 t0, "\n"]
+                [" ", pack $ show $ diffUTCTime t1 t0, "\n"] ++
+                logRsp
 
-        sendResponse rsp
+        sendResponse rsp'
   where
     allPostParams body =
         case getRequestBodyType req of
